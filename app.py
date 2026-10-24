@@ -2,11 +2,13 @@ import os
 import hashlib
 import uuid
 import html
+import hmac
 from functools import wraps
+import secrets
 
 from flask import (
     Flask, render_template_string, request, redirect,
-    url_for, flash, send_from_directory, abort
+    url_for, flash, send_from_directory, abort, session
 )
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import (
@@ -22,10 +24,18 @@ from werkzeug.utils import secure_filename
 # =========================================================
 
 app = Flask(__name__)
+# Set TRUSTVAULT_SECRET_KEY in your environment before deploying.
+# The local fallback is only for development; use a long random secret in production.
 app.config["SECRET_KEY"] = os.environ.get(
     "TRUSTVAULT_SECRET_KEY",
-    "replace-this-with-a-random-secret-key"
+    "dev-only-change-this-secret-before-deployment"
 )
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+# Enable this only when serving the app over HTTPS:
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get(
+    "TRUSTVAULT_HTTPS", "0"
+) == "1"
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///trustvault.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
@@ -62,6 +72,42 @@ class Document(db.Model):
     uploaded_at = db.Column(db.DateTime, default=db.func.current_timestamp())
 
 
+# Basic CSRF protection for all state-changing form submissions.
+# Each HTML form that uses POST must include the hidden csrf_token field.
+@app.before_request
+def protect_post_requests():
+    if request.method == "POST":
+        submitted_token = request.form.get("csrf_token", "")
+        saved_token = session.get("csrf_token", "")
+        if not saved_token or not submitted_token or not hmac.compare_digest(
+            submitted_token, saved_token
+        ):
+            abort(400, description="Invalid or missing CSRF token.")
+
+
+@app.context_processor
+def inject_csrf_token():
+    token = session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return {"csrf_token": token}
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; object-src 'none'; "
+        "base-uri 'self'; frame-ancestors 'none'"
+    )
+    return response
+
+
 @login_manager.user_loader
 def load_user(user_id):
     try:
@@ -96,19 +142,24 @@ def can_access_document(document):
     return is_admin() or document.owner_id == current_user.id
 
 
+def calculate_sha256(file_path):
+    """Calculate SHA-256 incrementally, without loading the whole file into RAM."""
+    digest = hashlib.sha256()
+    with open(file_path, "rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def document_is_intact(document):
     """Return False if the stored file is missing or its SHA-256 differs."""
-    path = os.path.join(app.config["UPLOAD_FOLDER"], document.filepath)
+    path = os.path.join(app.config["UPLOAD_FOLDER"], safe_file_path(document))
     if not os.path.isfile(path):
         return False
-    digest = hashlib.sha256()
     try:
-        with open(path, "rb") as file_obj:
-            for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
-                digest.update(chunk)
+        return calculate_sha256(path) == document.sha256_hash
     except OSError:
         return False
-    return digest.hexdigest() == document.sha256_hash
 
 
 def safe_file_path(document):
@@ -222,6 +273,15 @@ BASE_TEMPLATE = """
 
 
 def page(content, title="TrustVault"):
+    # Content pages are embedded as trusted HTML; replace the CSRF placeholder
+    # before inserting the page into the shared template.
+    token = session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    content = content.replace(
+        "{{ csrf_token }}", html.escape(token, quote=True)
+    )
     return render_template_string(
         BASE_TEMPLATE,
         content=content,
@@ -289,7 +349,7 @@ def register():
     content = """
         <h1>Create account</h1>
         <p class="sub">Create your TrustVault employee account.</p>
-        <form class="form" method="POST">
+        <form class="form" method="POST">\n            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <label>Full name<input name="name" required maxlength="100"></label>
             <label>Email<input name="email" type="email" required maxlength="120"></label>
             <label>Password<input name="password" type="password" required minlength="8"></label>
@@ -326,7 +386,7 @@ def login():
     content = """
         <h1>Login</h1>
         <p class="sub">Access your secure workspace.</p>
-        <form class="form" method="POST">
+        <form class="form" method="POST">\n            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <label>Email<input name="email" type="email" required></label>
             <label>Password<input name="password" type="password" required></label>
             <button class="btn" type="submit">Login</button>
@@ -399,12 +459,9 @@ def upload_document():
         unique_filename = f"{uuid.uuid4().hex}_{original_filename}"
         filepath = os.path.join(app.config["UPLOAD_FOLDER"], unique_filename)
 
-        file_content = file.read()
-        sha256_hash = hashlib.sha256(file_content).hexdigest()
-
         try:
-            with open(filepath, "wb") as uploaded_file:
-                uploaded_file.write(file_content)
+            file.save(filepath)
+            sha256_hash = calculate_sha256(filepath)
 
             document = Document(
                 filename=original_filename,
@@ -428,7 +485,7 @@ def upload_document():
     content = """
         <h1>Upload document</h1>
         <p class="sub">Maximum file size: 16 MB. Allowed formats: PDF, DOC, DOCX, TXT, PNG, JPG, JPEG.</p>
-        <form class="form" method="POST" enctype="multipart/form-data">
+        <form class="form" method="POST" enctype="multipart/form-data">\n            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <label>Select a file<input type="file" name="document" accept=".pdf,.doc,.docx,.txt,.png,.jpg,.jpeg" required></label>
             <button class="btn" type="submit">Upload document</button>
         </form>
@@ -455,6 +512,7 @@ def documents():
 
     document_list = query.order_by(Document.uploaded_at.desc()).all()
 
+    csrf_token = session.get("csrf_token", "")
     rows = ""
     for doc in document_list:
         intact = document_is_intact(doc)
@@ -481,6 +539,7 @@ def documents():
                         <a class="btn small secondary" href="/verify/{doc.id}">Verify</a>
                         <form method="POST" action="/delete/{doc.id}"
                               onsubmit="return confirm('Delete this document permanently?');">
+                            <input type="hidden" name="csrf_token" value="{csrf_token}">
                             <button class="btn small danger" type="submit">Delete</button>
                         </form>
                     </div>
@@ -668,6 +727,7 @@ def delete_document(document_id):
 def admin_users():
     users = User.query.order_by(User.id.asc()).all()
 
+    csrf_token = session.get("csrf_token", "")
     rows = ""
     for user in users:
         role_options = ""
@@ -682,6 +742,7 @@ def admin_users():
                 <td>{html.escape(user.email)}</td>
                 <td>
                     <form class="actions" method="POST" action="/admin/users/{user.id}/role">
+                        <input type="hidden" name="csrf_token" value="{csrf_token}">
                         <select name="role">{role_options}</select>
                         <button class="btn small" type="submit">Save role</button>
                     </form>
@@ -760,4 +821,4 @@ with app.app_context():
 # =========================================================
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=os.environ.get("FLASK_DEBUG", "0") == "1")
