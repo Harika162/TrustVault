@@ -8,7 +8,7 @@ import secrets
 
 from flask import (
     Flask, render_template_string, request, redirect,
-    url_for, flash, send_from_directory, abort, session
+    url_for, flash, send_from_directory, abort, session, jsonify
 )
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import (
@@ -77,6 +77,12 @@ class Document(db.Model):
 @app.before_request
 def protect_post_requests():
     if request.method == "POST":
+        # React calls the same-origin /api endpoints through the Vite proxy.
+        # Keep CSRF protection on traditional HTML forms; API routes use
+        # the session cookie (SameSite=Lax) and JSON responses instead.
+        if request.path.startswith("/api/"):
+            return
+
         submitted_token = request.form.get("csrf_token", "")
         saved_token = session.get("csrf_token", "")
         if not saved_token or not submitted_token or not hmac.compare_digest(
@@ -624,6 +630,7 @@ def verify_document(document_id):
 # =========================================================
 
 @app.route("/view/<int:document_id>")
+@app.route("/api/documents/<int:document_id>/view")
 @login_required
 def view_document(document_id):
     document = db.session.get(Document, document_id)
@@ -658,6 +665,7 @@ def view_document(document_id):
 # =========================================================
 
 @app.route("/download/<int:document_id>")
+@app.route("/api/documents/<int:document_id>/download")
 @login_required
 def download_document(document_id):
     document = db.session.get(Document, document_id)
@@ -807,6 +815,293 @@ def logout():
     flash("You have been logged out.")
     return redirect(url_for("home"))
 
+
+
+# =========================================================
+# JSON API FOR THE REACT FRONTEND
+# =========================================================
+
+def api_user_payload(user):
+    return {
+        "id": user.id,
+        "name": user.name,
+        "email": user.email,
+        "role": user.role,
+    }
+
+
+def api_error(message, status=400):
+    return jsonify({"success": False, "message": message}), status
+
+
+def api_login_required():
+    if not current_user.is_authenticated:
+        return api_error("Please log in to continue.", 401)
+    return None
+
+
+@app.route("/api/register", methods=["POST"])
+def api_register():
+    data = request.get_json(silent=True) or request.form
+    name = str(data.get("name", "")).strip()
+    email = str(data.get("email", "")).strip().lower()
+    password = str(data.get("password", ""))
+
+    if not name or not email or len(password) < 8:
+        return api_error("Name and email are required; password must be at least 8 characters.")
+
+    if User.query.filter_by(email=email).first():
+        return api_error("This email is already registered.", 409)
+
+    user = User(
+        name=name,
+        email=email,
+        password=generate_password_hash(password),
+        role="employee",
+    )
+    db.session.add(user)
+    db.session.commit()
+
+    return jsonify({
+        "success": True,
+        "message": "Account created successfully. Please log in.",
+        "user": api_user_payload(user),
+    }), 201
+
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.get_json(silent=True) or request.form
+    email = str(data.get("email", "")).strip().lower()
+    password = str(data.get("password", ""))
+
+    user = User.query.filter_by(email=email).first()
+    if not user or not check_password_hash(user.password, password):
+        return api_error("Invalid email or password.", 401)
+
+    login_user(user)
+    return jsonify({
+        "success": True,
+        "message": "Login successful.",
+        "user": api_user_payload(user),
+    })
+
+
+@app.route("/api/me", methods=["GET"])
+def api_me():
+    if not current_user.is_authenticated:
+        return api_error("Not logged in.", 401)
+    return jsonify({"success": True, "user": api_user_payload(current_user)})
+
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    if not current_user.is_authenticated:
+        return jsonify({"success": True, "message": "Already logged out."})
+    logout_user()
+    return jsonify({"success": True, "message": "Logged out successfully."})
+
+
+@app.route("/api/dashboard", methods=["GET"])
+def api_dashboard():
+    auth_error = api_login_required()
+    if auth_error:
+        return auth_error
+
+    if is_admin():
+        return jsonify({
+            "success": True,
+            "user": api_user_payload(current_user),
+            "stats": {
+                "users": User.query.count(),
+                "documents": Document.query.count(),
+            },
+        })
+
+    return jsonify({
+        "success": True,
+        "user": api_user_payload(current_user),
+        "stats": {
+            "documents": Document.query.filter_by(owner_id=current_user.id).count(),
+        },
+    })
+
+
+@app.route("/api/documents", methods=["GET", "POST"])
+def api_documents():
+    auth_error = api_login_required()
+    if auth_error:
+        return auth_error
+
+    if request.method == "POST":
+        uploaded_file = request.files.get("document") or request.files.get("file")
+        if not uploaded_file or not uploaded_file.filename:
+            return api_error("Please select a document.")
+
+        if not allowed_file(uploaded_file.filename):
+            return api_error("Unsupported file type. Allowed: PDF, DOC, DOCX, TXT, PNG, JPG, JPEG.")
+
+        original_filename = secure_filename(uploaded_file.filename)
+        if not original_filename:
+            return api_error("Invalid filename.")
+
+        unique_filename = f"{uuid.uuid4().hex}_{original_filename}"
+        filepath = os.path.join(app.config["UPLOAD_FOLDER"], unique_filename)
+
+        try:
+            uploaded_file.save(filepath)
+            sha256_hash = calculate_sha256(filepath)
+            document = Document(
+                filename=original_filename,
+                filepath=unique_filename,
+                owner_id=current_user.id,
+                sha256_hash=sha256_hash,
+            )
+            db.session.add(document)
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            if os.path.exists(filepath):
+                os.remove(filepath)
+            app.logger.exception("API document upload failed")
+            return api_error("Upload failed. Please try again.", 500)
+
+        return jsonify({
+            "success": True,
+            "message": "Document uploaded successfully.",
+            "document": {
+                "id": document.id,
+                "filename": document.filename,
+                "sha256": document.sha256_hash,
+                "uploaded_at": document.uploaded_at.isoformat() if document.uploaded_at else None,
+            },
+        }), 201
+
+    search_term = request.args.get("q", "").strip()
+    query = Document.query
+    if not is_admin():
+        query = query.filter_by(owner_id=current_user.id)
+    if search_term:
+        query = query.filter(Document.filename.ilike(f"%{search_term}%"))
+
+    documents = query.order_by(Document.uploaded_at.desc()).all()
+    return jsonify({
+        "success": True,
+        "documents": [{
+            "id": doc.id,
+            "filename": doc.filename,
+            "owner_id": doc.owner_id,
+            "owner_name": (
+                db.session.get(User, doc.owner_id).name
+                if db.session.get(User, doc.owner_id) else "Unknown"
+            ),
+            "uploaded_at": doc.uploaded_at.isoformat() if doc.uploaded_at else None,
+            "sha256": doc.sha256_hash,
+            "integrity_ok": document_is_intact(doc),
+            "view_url": f"/api/documents/{doc.id}/view",
+            "download_url": f"/api/documents/{doc.id}/download",
+            "verify_url": f"/api/documents/{doc.id}/verify",
+        } for doc in documents],
+    })
+
+
+@app.route("/api/documents/<int:document_id>/verify", methods=["GET"])
+def api_verify_document(document_id):
+    auth_error = api_login_required()
+    if auth_error:
+        return auth_error
+
+    document = db.session.get(Document, document_id)
+    if document is None:
+        return api_error("Document not found.", 404)
+    if not can_access_document(document):
+        return api_error("You do not have permission to access this document.", 403)
+
+    intact = document_is_intact(document)
+    return jsonify({
+        "success": True,
+        "document_id": document.id,
+        "filename": document.filename,
+        "integrity_ok": intact,
+        "status": "Verified - file is unchanged" if intact else "Verification failed",
+        "sha256": document.sha256_hash,
+    })
+
+
+@app.route("/api/documents/<int:document_id>", methods=["DELETE"])
+def api_delete_document(document_id):
+    auth_error = api_login_required()
+    if auth_error:
+        return auth_error
+
+    document = db.session.get(Document, document_id)
+    if document is None:
+        return api_error("Document not found.", 404)
+    if not can_access_document(document):
+        return api_error("You do not have permission to delete this document.", 403)
+
+    file_path = os.path.join(app.config["UPLOAD_FOLDER"], safe_file_path(document))
+    try:
+        if os.path.isfile(file_path):
+            os.remove(file_path)
+        db.session.delete(document)
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("API document deletion failed")
+        return api_error("Document deletion failed.", 500)
+
+    return jsonify({"success": True, "message": "Document deleted successfully."})
+
+
+@app.route("/api/admin/users", methods=["GET"])
+def api_admin_users():
+    auth_error = api_login_required()
+    if auth_error:
+        return auth_error
+    if not is_admin():
+        return api_error("Administrator access required.", 403)
+
+    users = User.query.order_by(User.id.asc()).all()
+    return jsonify({
+        "success": True,
+        "users": [{
+            **api_user_payload(user),
+            "document_count": Document.query.filter_by(owner_id=user.id).count(),
+        } for user in users],
+    })
+
+
+@app.route("/api/admin/users/<int:user_id>/role", methods=["PATCH"])
+def api_update_user_role(user_id):
+    auth_error = api_login_required()
+    if auth_error:
+        return auth_error
+    if not is_admin():
+        return api_error("Administrator access required.", 403)
+
+    user = db.session.get(User, user_id)
+    if user is None:
+        return api_error("User not found.", 404)
+
+    data = request.get_json(silent=True) or {}
+    new_role = str(data.get("role", "")).strip().lower()
+    if new_role not in {"admin", "employee"}:
+        return api_error("Role must be 'admin' or 'employee'.")
+    if user.id == current_user.id and new_role != "admin":
+        return api_error("You cannot remove your own administrator role.", 400)
+
+    user.role = new_role
+    db.session.commit()
+    return jsonify({
+        "success": True,
+        "message": "Role updated.",
+        "user": api_user_payload(user),
+    })
+
+
+# The React app can use these JSON endpoints while the original HTML routes
+# above continue to work for direct browser access.
 
 # =========================================================
 # DATABASE INITIALIZATION
